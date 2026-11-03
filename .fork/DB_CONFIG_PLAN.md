@@ -1,6 +1,6 @@
 # Fork plan: database-driven `/data` configuration with hot reload
 
-Status: **DRAFT rev 2. Q6 and Q8 need a decision (§10). Everything else is decided (§9).**
+Status: **DRAFT rev 3. Waiting on a decision about the metadata storage (§10). Everything else is decided (§9).**
 Base: upstream `overextended/ox_inventory` v2.48.1 (`39d4cc7`)
 
 ---
@@ -164,9 +164,9 @@ The six `*holster*` columns hold upstream's six-element `anim` tuple on weapons.
 | `shops` | `type PK, enabled, name, label NULL, icon NULL, blip_*` |
 | `shop_groups` | groups shape |
 | `shop_models` | `shop FK, sort, model, model_hash NULL` (vending-machine style shops) |
-| `shop_items` | `shop FK, sort, name, price INT, count INT NULL, currency NULL, license NULL, min_grade INT NULL` |
-| `shop_item_grades` | `shop FK, item_sort, grade INT`. This holds the list form of `grade`. If any rows exist, they win over `min_grade`. |
-| `shop_item_metadata` | `shop FK, item_sort, meta_key, value_type ENUM('string','number','boolean'), value_string, value_number DOUBLE, value_bool` |
+| `shop_items` | `id PK AUTO_INCREMENT, shop FK, sort, item, price INT, count INT NULL, currency NULL, license NULL, min_grade INT NULL, UNIQUE(shop, sort)` |
+| `shop_item_grades` | `shop_item FK, grade INT`. This holds the list form of `grade`. If any rows exist, they win over `min_grade`. |
+| `shop_item_metadata` | `shop_item FK, meta_key, value_type ENUM('string','number','boolean'), value_string, value_number DOUBLE, value_bool, PK(shop_item, meta_key)`. Worked example: `.fork/examples/item_metadata.sql`. |
 | `shop_locations` | `shop FK, sort, x, y, z, heading, ped, ped_hash NULL, scenario` + box zone columns. One row per location; this holds upstream's parallel `locations[i]`/`targets[i]` arrays together. |
 
 ### 5.4 stashes
@@ -178,9 +178,9 @@ columns`)` and `stash_groups`.
 |---|---|
 | `crafting_benches` | `name PK, enabled, label NULL, blip_*` |
 | `crafting_bench_groups` | groups shape |
-| `crafting_recipes` | `bench FK, sort, item, count INT, duration INT` |
-| `crafting_ingredients` | `bench FK, recipe_sort, item, amount DECIMAL(10,4)`. An amount below 1 means durability cost, as upstream treats it. |
-| `crafting_recipe_metadata` | same typed key/value shape as `shop_item_metadata` |
+| `crafting_recipes` | `id PK AUTO_INCREMENT, bench FK, sort, item, count INT, duration INT, UNIQUE(bench, sort)` |
+| `crafting_ingredients` | `recipe FK, item, amount DECIMAL(10,4)`. An amount below 1 means durability cost, as upstream treats it. |
+| `crafting_recipe_metadata` | `recipe FK`, plus the same typed key/value columns as `shop_item_metadata` |
 | `crafting_points` | `bench FK, sort, x, y, z` |
 | `crafting_zones` | `bench FK, sort` + box zone columns |
 | `crafting_zone_groups` | `bench FK, zone_sort, group_name, min_grade` |
@@ -257,7 +257,7 @@ with `lib.logger`, and fires `ox_inventory:configReloaded(name)` for third-party
 ### 6.4 What `apply()` does for each config (all decided)
 | Config | Server | Client |
 |---|---|---|
-| items/weapons | Change `ItemList` in place, re-resolve exports, re-sync the ESX/QB item registry. | Change `Items` in place, then the NUI step (Q6). |
+| items/weapons | Change `ItemList` in place, re-resolve exports, re-sync the ESX/QB item registry. | Change `Items` in place, then send the NUI an `updateItems` message (Q6). |
 | shops | Rebuild shop definitions. Shops that are open keep their contents until they next load (decided: *next load*). | Remove points, targets, peds and blips, then re-create them. |
 | stashes | Rebuild `RegisteredStashes`. Loaded stash inventories keep their size until they unload. | `Inventory.Stashes()` |
 | crafting | Rebuild `CraftingBenches`. | Remove zones, points and blips, then rebuild. |
@@ -284,9 +284,8 @@ names those items in the reload report.
 2. **Simple configs:** animations, licenses, evidence, vehicles.
 3. **Stashes and crafting.**
 4. **Shops.**
-5. **Items and weapons:** export bridge, NUI step (Q6), framework re-sync.
+5. **Items and weapons:** export bridge, `updateItems` NUI message plus UI rebuild (Q6), framework re-sync.
 6. **Tooling:** `seed`, `audit`, `status`, rebase checklist, docs.
-7. *(If approved)* **Settings from convars** (Q8).
 
 ---
 
@@ -310,118 +309,22 @@ names those items in the reload report.
 | Q3 | Keep upstream behavior for removed items. |
 | Q4 | Size changes apply on next load. |
 | Q5 | Reload by command only. |
+| Q6 | **B:** a new `updateItems` NUI message (about 15 lines in `web/src`). The fork ships its own rebuilt `web/build`, built in CI. |
 | Q7 | No JSON columns. Every expected field gets a column, and upstream drift gets a migration. |
+| Q8 | Convars stay convars. Only the `data/` configs move to the database. |
 | Q9 | `/invconfig`, ace `command.invconfig`, table prefix `ox_inventory_config_`. |
 
 ---
 
-## 10. Open: details for Q6 and Q8
+## 10. Open: storing metadata
 
-### Q6. Updating item data in the NUI while it is open
+Shop item metadata, crafting recipe metadata and `client.status` accept any key upstream. With no
+JSON allowed, the plan stores them as typed key/value rows (§5.11). See
+`.fork/examples/item_metadata.sql` for the full DDL, sample rows and the Lua the loader builds
+from them.
 
-**How the UI uses item data.** The React UI keeps an `Items` cache (`web/src/store/items.ts`).
-- The `init` message (`App.tsx:94`) *merges* the items it receives into that cache. It then sets
-  the image path and dispatches `setupInventory({ leftInventory })`.
-- If the cache has no entry for an item, the UI asks Lua for it through the `getItemData`
-  callback.
-- Tooltips, labels, images, `buttons`, `ammoName`, component labels and crafting ingredient
-  labels all come from this cache.
+Limitation: values must be a string, a number or a boolean. Nested tables (e.g.
+`metadata = { components = { 'at_flashlight' } }`) are rejected by the validator. Upstream's own
+data files don't use nested metadata.
 
-The Lua side changes live in every option below. The options differ only in what the *UI* shows.
-
-| Option | `web/` changes | Behavior | Rebase cost |
-|---|---|---|---|
-| **A. Re-send `init`** | none | After a reload, each client re-sends `init` with the current locale, items, left inventory and image path. **If the inventory is open, the send waits until it closes**, because `setupInventory` rebuilds the left inventory state and would cut off a drag or a half-finished split. Changed labels, images and buttons appear the next time the inventory opens. Items removed from config stay in the cache, but no slot can hold them after the next load, so nothing shows them. | none |
-| **B. New `updateItems` message** | About 15 lines: a `useNuiEvent('updateItems')` handler that replaces or deletes `Items` entries in place, plus a one-line hook in `App.tsx`. The UI must be rebuilt. | Updates show at once, even with the inventory open. Deleted items are removed from the cache. | A new file plus one line in `App.tsx`. Merge conflicts are rare, but **every fork release must ship a rebuilt `web/build`**, or CI must build it. |
-| **C. No UI refresh** | none | The UI shows old labels, images and buttons until the player reconnects. Server and client logic still use the new config. | none |
-
-**My recommendation is A.** It has no web diff, and applying when the inventory closes matches the
-"next load" approach you chose in Q4. Use B only if admins need to see changes in an inventory
-that is already open.
-
-**To decide:** do you ship a self-built `web/build` (B is cheap), or the upstream release zip
-(B means running your own UI build pipeline)?
-
-### Q8. Moving `inventory:*` convars to the database
-
-If approved, the settings live in one typed single-row table, `ox_inventory_config_settings`, with
-one column per scalar setting. Each list setting gets its own child table (no JSON):
-`settings_police_groups`, `settings_accounts`, `settings_loot (pool ENUM('vehicle','dumpster'),
-item, min, max, chance)`, `settings_valid_hosts`, `settings_keys`, `settings_enable_keys`,
-`settings_ignore_weapons`, `settings_markers (kind ENUM('shop','evidence','drop','crafting'),
-type, r, g, b, scale_x/y/z)`. A NULL column falls back to the convar, so an empty table behaves
-exactly like upstream.
-
-Reload classes:
-- **Live**: the code reads the value each time it's used, so `/invconfig reload settings` takes
-  effect at once.
-- **Next load**: affects inventories, shops or drops created after the reload.
-- **Restart**: the value is read once at startup (a command, keybind or bridge registration), so a
-  change needs a resource restart. Moving these to the DB gives only central storage, not hot
-  changes.
-
-**Shared (server and client)**
-| Convar | Default | What it does | Reload class | Notes and recommendation |
-|---|---|---|---|---|
-| `framework` | `esx` | Picks the bridge module | Restart | The bridge loads once at startup and can't be swapped live. **Keep as convar.** |
-| `slots` | 50 | Player slot count | Next load | Players get the new count on their next login. **DB OK.** |
-| `weight` | 30000 | Player max weight | Next load | Same as `slots`. **DB OK.** |
-| `target` | false | ox_target zones instead of markers | Restart | Changes how every shop, stash, bench and evidence locker is built. A live change would mean a full teardown and rebuild, and the setting must match whether ox_target is running. **Keep as convar.** |
-| `police` | `["police","sheriff"]` | Police groups (evidence, holster anim, `@police` expansion) | Live, plus rebuilds of the configs that use `@police` | A reload of `settings` re-expands `@police` in shops and stashes. **DB OK.** |
-| `networkdumpsters` | false | Server-synced dumpster inventories | Restart | The client starts a freeze loop at load time. **Keep as convar.** |
-| `dropslots` | = `slots` | Slots in a ground drop | Next load (new drops) | **DB OK.** |
-| `dropweight` | = `weight` | Max weight of a ground drop | Next load (new drops) | **DB OK.** |
-
-**Server only**
-| Convar | Default | What it does | Reload class | Notes and recommendation |
-|---|---|---|---|---|
-| `loghookrejection` | true | Logs rejected hook calls | Live | **DB OK.** |
-| `bulkstashsave` | true | Saves stashes in batches | Live | **DB OK.** |
-| `loglevel` | 1 | How much `lib.logger` logs | Live | **DB OK.** |
-| `randomprices` | false | ±20% on money shop prices | Next load (shop rebuild) | Applies when shops are rebuilt, which `reload settings` triggers. **DB OK.** |
-| `randomloot` | true | Gives loot to dumpsters and vehicles | Live | **DB OK.** |
-| `evidencegrade` | 2 | Minimum police grade to open evidence | Live | **DB OK.** |
-| `trimplate` | true | Trims plate whitespace in vehicle inventory ids | Live, but **dangerous** | Changing it at runtime changes the inventory id of every vehicle, so a car would open a different, empty trunk or glovebox. **Keep as convar** (startup only). |
-| `vehicleloot` | 7 entries | Loot table for vehicle storage | Live | Child table `settings_loot`. **DB OK** (a good fit). |
-| `dumpsterloot` | 4 entries | Loot table for dumpsters | Live | Same as `vehicleloot`. **DB OK.** |
-| `validhosts` | fivemanage, fmfile | Allowed hosts for item image URLs | Live | **DB OK.** |
-| `accounts` | `["money"]` | Items mirrored to framework accounts | Next load | The ESX and ND bridges read it in their sync loops. **DB OK**, but a change only fully applies after players re-login. |
-| `cleartime` | 5 (min) | Unloads idle inventories | Restart (captured in a local, `modules/inventory/server.lua:2412`) | Would need one more patched line. **Keep as convar** unless you want it. |
-| `clearstashes` | `6 MONTH` | Deletes old stashes on startup | Restart (runs once) | **Keep as convar.** |
-| `webhook` | empty | Image-upload webhook for screenshots | Restart (local, `modules/utils/server.lua:5`) | **This is a secret.** Storing it in the DB widens who can read it. **Keep as convar.** |
-| `versioncheck` | true | Checks for updates on startup | Restart | **Keep as convar.** |
-
-**Client only.** Players can't set these; the server sends them in the config payload.
-| Convar | Default | What it does | Reload class | Notes and recommendation |
-|---|---|---|---|---|
-| `autoreload` | false | Reloads automatically when the clip is empty | Live | **DB OK.** |
-| `screenblur` | true | Blurs the screen while the inventory is open | Live | **DB OK.** |
-| `keys` | F2, K, TAB | Default keybinds | Restart | `RegisterKeyMapping` runs once. FiveM also keeps each player's own binding after the first registration, so a new default never reaches existing players. **Keep as convar.** |
-| `enablekeys` | `[249]` | Controls still allowed while the inventory is open | Live | **DB OK.** |
-| `aimedfiring` | false | Only allows firing while aiming | Live | **DB OK.** |
-| `giveplayerlist` | false | Shows a nearby-player picker when giving items | Live | **DB OK.** |
-| `weaponanims` | true | Plays holster animations | Live | **DB OK.** |
-| `itemnotify` | true | Shows item add/remove notifications | Live | **DB OK.** |
-| `weaponnotify` | true | Shows equip/holster notifications | Live | **DB OK.** |
-| `imagepath` | `nui://ox_inventory/web/images` | Base path for item images | Next load (items reload plus NUI step, Q6) | Linked to Q6. **DB OK.** |
-| `dropprops` | false | Shows props for ground drops | Live (new drops) | **DB OK.** |
-| `dropmodel` | `prop_med_bag_01b` | Model for drop props | Live (new drops) | **DB OK.** |
-| `weaponmismatch` | true | Removes weapons the inventory doesn't hold | Live | **DB OK.** |
-| `ignoreweapons` | `[]` | Weapons skipped by the mismatch check | Live | Child table. **DB OK.** |
-| `suppresspickups` | true | Suppresses GTA weapon pickups | Live (next weapon-wheel toggle) | **DB OK.** |
-| `disableweapons` | false | Turns off weapon handling entirely | Live, but risky | Turning it off mid-session can leave weapon state out of sync. **Keep as convar** or make it next-load. |
-| `disablesetupnotification` | false | Hides the "not set up" warning | Startup | It only matters once. **Either.** |
-| `enablestealcommand` | true | Registers `/steal` | Restart | `RegisterCommand` runs once. **Keep as convar.** |
-| `gloveboxseatrestriction` | 0 | Glovebox access only from front seats | Live | **DB OK.** |
-| `shopmarker`, `evidencemarker`, `dropmarker`, `craftingmarker` | built-in | Marker type, colour and scale | Live (read each frame) | Child table `settings_markers`. **DB OK.** |
-
-**My recommendation:** move the settings marked **DB OK** in phase 7. Keep `framework`, `target`,
-`networkdumpsters`, `trimplate`, `cleartime`, `clearstashes`, `webhook`, `versioncheck`, `keys`,
-`enablestealcommand` and `disableweapons` as convars.
-
-**To decide:** approve or edit the per-setting list above.
-
-### Also please confirm
-- **§5.11 typed key/value tables:** `shop_item_metadata`, `crafting_recipe_metadata` and
-  `item_client_status` exist because upstream lets those keys be anything. Are typed key/value
-  rows acceptable there, along with not supporting nested metadata values?
+**To decide:** accept the typed key/value rows, or choose another approach.
